@@ -9,21 +9,10 @@ import numpy as np
 import pandas as pd
 import requests
 import useq
+import tifffile
+
 
 from rtm_pymmcore.microscope.abstract_microscope import AbstractMicroscope
-
-try:
-    import tifffile
-
-    HAS_TIFFFILE = True
-except ImportError:
-    HAS_TIFFFILE = False
-    try:
-        from PIL import Image
-
-        HAS_PIL = True
-    except ImportError:
-        HAS_PIL = False
 
 
 class UC2(AbstractMicroscope):
@@ -206,15 +195,8 @@ class UC2(AbstractMicroscope):
         # Load the image and call pipeline if available
         if self.pipeline is not None:
             try:
-                # Load image
-                if HAS_TIFFFILE:
-                    img = tifffile.imread(filepath)
-                elif HAS_PIL:
-                    img = np.array(Image.open(filepath))
-                else:
-                    print("UC2: No image loading library available (install tifffile)")
-                    return
-
+                img = tifffile.imread(filepath)
+                
                 # Ensure image has channel dimension (pipeline expects 3D: CYX)
                 if img.ndim == 2:
                     img = img[np.newaxis, :, :]  # Add channel dimension
