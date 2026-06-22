@@ -403,6 +403,93 @@ def generate_fov_positions(mic, viewer=None, filename=None, fake_fovs=None):
 generate_fov_objects = generate_fov_positions
 
 
+def filter_close_fovs(fovs, min_distance, drop=False):
+    """Report (and optionally drop) FOVs whose stage positions are too close.
+
+    Args:
+        fovs: list of FOV positions. Each item may be a ``FovPosition`` (or any
+            object with ``.x`` / ``.y`` attributes) or a dict with ``"x"`` /
+            ``"y"`` keys (e.g. entries loaded from a ``fovs.json`` file).
+        min_distance: minimum allowed centre-to-centre distance, in the same
+            units as the positions (stage micrometres on Micro-Manager).
+        drop: if True, return a new list with the too-close FOVs removed; if
+            False (default), the input list is returned unchanged (report only).
+
+    Returns:
+        The FOV list -- pruned when ``drop=True``, otherwise the original list.
+
+    Always prints the FOV count. If any pair is closer than ``min_distance`` it
+    emits a UserWarning naming every offending pair (by index, plus name when
+    one is set).
+
+    Naive de-duplication (``drop=True``): repeatedly finds the first pair below
+    the threshold, removes ONE of the two (the later-indexed one), then
+    re-checks from scratch, until no pair violates. For a connected cluster of
+    several mutually-close FOVs this just drops one at a time until the
+    survivors are all far enough apart -- it does NOT compute the optimal
+    maximum-retained subset, so for dense clusters it may remove more FOVs than
+    strictly necessary. Fine for sparse accidental overlaps.
+    """
+    import warnings
+
+    def _xy(f):
+        if hasattr(f, "x"):
+            return float(f.x), float(f.y)
+        return float(f["x"]), float(f["y"])
+
+    def _label(i, f):
+        name = getattr(f, "name", None)
+        if name is None and isinstance(f, dict):
+            name = f.get("name")
+        return f"FOV {i}" + (f" ({name})" if name not in (None, str(i)) else "")
+
+    def _close_pairs(items):
+        pairs = []
+        for a in range(len(items)):
+            xa, ya = _xy(items[a])
+            for b in range(a + 1, len(items)):
+                xb, yb = _xy(items[b])
+                dist = math.hypot(xa - xb, ya - yb)
+                if dist < min_distance:
+                    pairs.append((a, b, dist))
+        return pairs
+
+    fovs = list(fovs)
+    print(f"{len(fovs)} FOVs")
+
+    pairs = _close_pairs(fovs)
+    if not pairs:
+        print(f"All FOVs are >= {min_distance} apart.")
+        return fovs
+
+    warnings.warn(
+        f"{len(pairs)} FOV pair(s) closer than {min_distance}:\n"
+        + "\n".join(
+            f"  {_label(a, fovs[a])} <-> {_label(b, fovs[b])}: {d:.1f}"
+            for a, b, d in pairs
+        ),
+        UserWarning,
+        stacklevel=2,
+    )
+
+    if not drop:
+        return fovs
+
+    # Naive greedy pruning (see docstring): drop the later FOV of the first
+    # violating pair, then re-check, until none remain.
+    kept = list(fovs)
+    n_removed = 0
+    while True:
+        pp = _close_pairs(kept)
+        if not pp:
+            break
+        a, b, _ = pp[0]
+        del kept[b]
+        n_removed += 1
+    print(f"Dropped {n_removed} too-close FOV(s); {len(kept)} remain.")
+    return kept
+
+
 def generate_df_acquire_simple(
     fovs, n_frames, time_between_timesteps, channels, start_time=0
 ):
