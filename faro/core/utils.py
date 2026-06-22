@@ -403,6 +403,76 @@ def generate_fov_positions(mic, viewer=None, filename=None, fake_fovs=None):
 generate_fov_objects = generate_fov_positions
 
 
+# Components larger than this are solved with the greedy fallback instead of
+# the exact maximum-independent-set search, to bound worst-case runtime.
+_MIS_EXACT_LIMIT = 24
+
+
+def _mis_exact(nodes: tuple, adj: dict, memo: dict) -> set:
+    """Maximum independent set of the induced subgraph on ``nodes``.
+
+    Exhaustive include/exclude branch on the first node, memoized by node set.
+    Ties prefer *including* the lowest-index node, so lower-indexed FOVs are
+    kept preferentially.
+    """
+    if not nodes:
+        return set()
+    if nodes in memo:
+        return memo[nodes]
+    v, rest = nodes[0], nodes[1:]
+    excl = _mis_exact(rest, adj, memo)
+    rest_incl = tuple(u for u in rest if u not in adj[v])
+    incl = {v} | _mis_exact(rest_incl, adj, memo)
+    best = incl if len(incl) >= len(excl) else excl
+    memo[nodes] = best
+    return best
+
+
+def _mis_greedy(nodes: set, adj: dict) -> set:
+    """Greedy fallback: drop the highest-degree node until no edge remains.
+
+    Ties drop the higher-index node (keeps lower indices). Not optimal.
+    """
+    kept = set(nodes)
+    while True:
+        deg = {u: len(adj[u] & kept) for u in kept}
+        worst = max(kept, key=lambda u: (deg[u], u))
+        if deg[worst] == 0:
+            break
+        kept.discard(worst)
+    return kept
+
+
+def _independent_keep(n: int, adj: dict) -> set:
+    """Indices in ``range(n)`` to KEEP so no edge in ``adj`` remains, keeping
+    as many as possible (maximum independent set). Solved exactly per connected
+    component, with a greedy fallback for components above ``_MIS_EXACT_LIMIT``.
+    """
+    keep: set = set()
+    seen: set = set()
+    for start in range(n):
+        if start in seen:
+            continue
+        # BFS the connected component containing `start`
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for w in adj.get(u, ()):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        if len(comp) == 1:  # no conflicts -> always kept
+            keep.add(comp[0])
+        elif len(comp) <= _MIS_EXACT_LIMIT:
+            keep |= _mis_exact(tuple(sorted(comp)), adj, {})
+        else:
+            keep |= _mis_greedy(set(comp), adj)
+    return keep
+
+
 def filter_close_fovs(fovs, min_distance, drop=False):
     """Report (and optionally drop) FOVs whose stage positions are too close.
 
@@ -419,16 +489,17 @@ def filter_close_fovs(fovs, min_distance, drop=False):
         The FOV list -- pruned when ``drop=True``, otherwise the original list.
 
     Always prints the FOV count. If any pair is closer than ``min_distance`` it
-    emits a UserWarning naming every offending pair (by index, plus name when
-    one is set).
+    emits a UserWarning naming every offending pair and the exact set of FOVs
+    that would be dropped -- reported in both modes, so with ``drop=False`` you
+    can see which FOVs *would* go without changing anything.
 
-    Naive de-duplication (``drop=True``): repeatedly finds the first pair below
-    the threshold, removes ONE of the two (the later-indexed one), then
-    re-checks from scratch, until no pair violates. For a connected cluster of
-    several mutually-close FOVs this just drops one at a time until the
-    survivors are all far enough apart -- it does NOT compute the optimal
-    maximum-retained subset, so for dense clusters it may remove more FOVs than
-    strictly necessary. Fine for sparse accidental overlaps.
+    Optimal de-duplication: keeps the MAXIMUM number of FOVs such that no two
+    remaining are closer than ``min_distance`` -- a maximum independent set of
+    the "too-close" graph (FOVs = nodes, edges = pairs below the threshold) --
+    so it removes the fewest FOVs possible. Solved exactly per connected
+    component; ties keep lower-indexed FOVs. Components larger than
+    ``_MIS_EXACT_LIMIT`` nodes use a greedy high-degree-removal fallback to
+    bound runtime (rare for real layouts).
     """
     import warnings
 
@@ -462,12 +533,22 @@ def filter_close_fovs(fovs, min_distance, drop=False):
         print(f"All FOVs are >= {min_distance} apart.")
         return fovs
 
+    # Optimal selection: keep a maximum independent set; drop the rest.
+    adj: dict = defaultdict(set)
+    for a, b, _ in pairs:
+        adj[a].add(b)
+        adj[b].add(a)
+    keep = _independent_keep(len(fovs), adj)
+    dropped = [i for i in range(len(fovs)) if i not in keep]
+
     warnings.warn(
         f"{len(pairs)} FOV pair(s) closer than {min_distance}:\n"
         + "\n".join(
             f"  {_label(a, fovs[a])} <-> {_label(b, fovs[b])}: {d:.1f}"
             for a, b, d in pairs
-        ),
+        )
+        + f"\nWould drop {len(dropped)} FOV(s) (optimal): "
+        + (", ".join(_label(i, fovs[i]) for i in dropped) or "none"),
         UserWarning,
         stacklevel=2,
     )
@@ -475,18 +556,9 @@ def filter_close_fovs(fovs, min_distance, drop=False):
     if not drop:
         return fovs
 
-    # Naive greedy pruning (see docstring): drop the later FOV of the first
-    # violating pair, then re-check, until none remain.
-    kept = list(fovs)
-    n_removed = 0
-    while True:
-        pp = _close_pairs(kept)
-        if not pp:
-            break
-        a, b, _ = pp[0]
-        del kept[b]
-        n_removed += 1
-    print(f"Dropped {n_removed} too-close FOV(s); {len(kept)} remain.")
+    dropped_set = set(dropped)
+    kept = [f for i, f in enumerate(fovs) if i not in dropped_set]
+    print(f"Dropped {len(dropped)} too-close FOV(s); {len(kept)} remain.")
     return kept
 
 
