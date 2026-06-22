@@ -403,6 +403,62 @@ def generate_fov_positions(mic, viewer=None, filename=None, fake_fovs=None):
 generate_fov_objects = generate_fov_positions
 
 
+def _set_mda_in_viewer(viewer, stage_positions) -> None:
+    """Write *stage_positions* (useq.Position list) into the napari-mm MDA widget.
+
+    Only the positions are replaced; the widget's other settings (time plan,
+    channels, etc.) are preserved.
+    """
+    try:
+        mda_widget = viewer.window.dock_widgets["MDA"]
+    except KeyError as e:
+        raise KeyError(
+            "MDA dock widget not registered. Click the 'MDA' button in the "
+            "napari-micromanager toolbar (or call "
+            "`main_window._show_dock_widget('MDA')` programmatically) "
+            "before writing FOVs to the viewer."
+        ) from e
+    current = mda_widget.value()
+    mda_widget.setValue(current.replace(stage_positions=tuple(stage_positions)))
+
+
+def set_fov_positions(fov_positions, viewer):
+    """Populate the napari-micromanager MDA widget with a list of FOVs.
+
+    Inverse of ``generate_fov_positions(mic, viewer=viewer)``: instead of
+    reading the FOVs the user picked in the MDA widget, push a Python list of
+    FOVs into the widget's position table — e.g. a curated/filtered list (see
+    :func:`filter_close_fovs`) or one loaded from a ``fovs.json`` file.
+
+    Args:
+        fov_positions: list of FOV positions. Each item may be a
+            ``FovPosition`` (or any object with ``.x`` / ``.y`` / ``.z`` /
+            ``.name``) or a dict with ``"x"`` / ``"y"`` / ``"z"`` / ``"name"``
+            keys (e.g. ``fovs.json`` entries).
+        viewer: napari viewer hosting the napari-micromanager MDA dock widget.
+
+    Returns:
+        The list of ``useq.Position`` written to the widget.
+
+    The MDA widget's other settings (time plan, channels, …) are preserved;
+    only the stage positions are replaced.
+    """
+    import useq
+
+    positions = []
+    for i, f in enumerate(fov_positions):
+        if isinstance(f, dict):
+            x, y, z, name = f.get("x"), f.get("y"), f.get("z"), f.get("name")
+        else:
+            x, y = f.x, f.y
+            z, name = getattr(f, "z", None), getattr(f, "name", None)
+        positions.append(
+            useq.Position(x=x, y=y, z=z, name=str(i) if name is None else name)
+        )
+    _set_mda_in_viewer(viewer, positions)
+    return positions
+
+
 # Components larger than this are solved with the greedy fallback instead of
 # the exact maximum-independent-set search, to bound worst-case runtime.
 _MIS_EXACT_LIMIT = 24
