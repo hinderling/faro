@@ -734,6 +734,13 @@ class Controller:
         self._n_channels: int = 1
         self._frame_buffers: dict[tuple, list] = {}
 
+        # (t, p) of imaging frames whose acquisition has completed (all
+        # channels received + submitted to the pipeline). The feed loop waits
+        # on this before computing a stim's mask, so it never asks the pipeline
+        # for a predecessor frame that has not been acquired yet.
+        self._acquired_frames: set[tuple[int, int]] = set()
+        self._acquired_lock = threading.Lock()
+
         # Continuation state
         self._t_offset: int = 0
         self._time_offset: float = 0.0
@@ -1222,6 +1229,8 @@ class Controller:
         # (the run "sticks" after a few events). A fresh queue per run
         # avoids that entirely.
         self._queue = Queue()
+        with self._acquired_lock:
+            self._acquired_frames.clear()
 
         # Set up event queue for extend_experiment support.
         # _pending_sentinels tracks how many extra batches (from
@@ -1387,6 +1396,24 @@ class Controller:
                 for ev in planned:
                     if ev.metadata.get("img_type") == ImgType.IMG_STIM:
                         if slm is None and self._mic.dmd:
+                            # The stim mask derives from an already-acquired
+                            # frame: (t-1, p) in "previous" mode, (t, p) in
+                            # "current" mode (whose imaging events were queued
+                            # just above). The feed loop runs several events
+                            # ahead of the camera, so without this gate it would
+                            # build the stim SLM -- blocking get_stim_mask -- for
+                            # a predecessor frame that has not been acquired yet,
+                            # and the mask wait would time out before the frame
+                            # even exists. Waiting for the acquisition keeps that
+                            # wait short and the timeout a genuine error signal.
+                            t_pred = rtm_event.index.get("t", 0)
+                            if stim_mode == "previous":
+                                t_pred -= 1
+                            p_pred = rtm_event.index.get("p", 0)
+                            if not self._wait_for_frame_acquired(
+                                t_pred, p_pred, handle
+                            ):
+                                break
                             slm = self._build_stim_slm(rtm_event, stim_mode=stim_mode)
                         if slm is not None:
                             ev = ev.model_copy(update={"slm_image": slm})
@@ -1531,6 +1558,10 @@ class Controller:
         if len(buf) >= n_expected:
             frame = np.stack(buf, axis=0)
             del self._frame_buffers[tp]
+            # Mark this (t, p) acquired so the feed loop's stim gate can
+            # release before asking the pipeline for its mask.
+            with self._acquired_lock:
+                self._acquired_frames.add(tp)
             self._analyzer.run(frame, event)
 
     def _abort_mda_from_callback(self, message: str) -> None:
@@ -1550,6 +1581,29 @@ class Controller:
     # ------------------------------------------------------------------
     # Stim helpers
     # ------------------------------------------------------------------
+
+    def _wait_for_frame_acquired(self, t: int, p: int, handle: RunHandle) -> bool:
+        """Block until imaging frame ``(t, p)`` has been acquired.
+
+        Returns ``True`` once the frame is acquired (all channels received +
+        submitted to the pipeline), or ``False`` if the run is cancelled or a
+        fatal error aborts the MDA first. The feed loop calls this before
+        building a stim's SLM so it never asks the pipeline for a predecessor
+        frame's mask before that frame exists.
+
+        The predecessor frame is always queued in an earlier feed-loop
+        iteration than the stim that depends on it, so the wait resolves as
+        soon as the engine works through the queue -- there is no deadlock. It
+        is engine-agnostic: keyed off the per-frame ready callback, not any
+        microscope-specific timing.
+        """
+        while not handle.cancel_event.is_set() and self._fatal_error is None:
+            with self._acquired_lock:
+                if (t, p) in self._acquired_frames:
+                    return True
+            if handle.cancel_event.wait(0.05):
+                break
+        return False
 
     def _build_stim_slm(
         self, rtm_event, *, stim_mode: str = "current"
@@ -1641,6 +1695,8 @@ class ControllerSimulated(Controller):
 
         if len(buf) >= n_expected:
             del self._frame_buffers[tp]
+            with self._acquired_lock:
+                self._acquired_frames.add(tp)
             fname = meta["fname"]
             t_idx = event.index.get("t", 0)
             p_idx = event.index.get("p", 0)
