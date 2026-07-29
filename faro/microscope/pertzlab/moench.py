@@ -1,6 +1,8 @@
 import pymmcore_plus
 import weakref
 
+import numpy as np
+
 from faro.microscope.pymmcore import PyMMCoreMicroscope
 from faro.core.data_structures import ImgType
 from faro.core.dmd import DMD
@@ -791,6 +793,26 @@ class MoenchMDAEngine(MDAEngine):
         mode). The stim *dose* is unaffected -- it is gated by the
         camera-triggered LED, not the DMD. See ``nikonti-re/mosaic3/FINDINGS.md``.
         """
+        core = self.mmcore
+        # Expand a scalar-bool SLMImage (data=True all-on / data=False all-off) to
+        # a full array. The base engine renders a scalar via setSLMPixelsTo, which
+        # the Mosaic3 SILENTLY IGNORES (no error) -- so the previously-latched
+        # pattern stays displayed. That is the "first stim is all-on" bug: the
+        # first stim's mask isn't ready yet -> _build_stim_slm sends data=False ->
+        # setSLMPixelsTo(0) no-ops -> the held all-on fires full-field. Routing
+        # through setSLMImage (arrays) is the only reliable path on this DMD.
+        if event.slm_image is not None:
+            data = np.asarray(event.slm_image.data)
+            if data.ndim == 0:
+                slm_dev = event.slm_image.device or core.getSLMDevice()
+                arr = np.full(
+                    (core.getSLMHeight(slm_dev), core.getSLMWidth(slm_dev)),
+                    255 if bool(data.item()) else 0,
+                    dtype=np.uint8,
+                )
+                event = event.model_copy(
+                    update={"slm_image": event.slm_image.model_copy(update={"data": arr})}
+                )
         super()._set_event_slm_image(event)
         if event.slm_image is None:
             return
