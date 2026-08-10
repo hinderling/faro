@@ -133,6 +133,12 @@ class StimUp(StimWithPipeline):
         if tracks is None or tracks.empty:
             return stim_mask, None
 
+        # Control FOVs in a region-percentage run share this stimulator but
+        # carry stim_fov=False, so they get an empty mask. A missing key means
+        # "stimulate" -- only an explicitly falsy flag opts a FOV out.
+        if not (metadata or {}).get("stim_fov", True):
+            return stim_mask, None
+
         current = tracks[tracks["timestep"] == tracks["timestep"].max()]
         label_to_particle = dict(zip(current["label"], current["particle"]))
 
