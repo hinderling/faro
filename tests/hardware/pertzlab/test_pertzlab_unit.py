@@ -485,3 +485,133 @@ class TestKeepDMDAliveLifecycle:
             assert keep_alive.thread is None
         finally:
             keep_alive.stop()
+
+
+# ===================================================================
+# PFS health monitoring: two-tier probe (cheap boolean + periodic Status)
+# ===================================================================
+
+
+class _PFSMic:
+    """Weakref-able Moench stand-in recording which PFS reads the monitor pays.
+
+    ``read_pfs_engaged_fast`` returns scripted values (sticking at the last
+    one, which models the frozen read of an unpatched adapter DLL);
+    ``pfs_health`` returns a fixed (state, status) tuple. The call counters
+    are what the tests assert on: the design goal is that a quiet event costs
+    one fast read and zero reloads.
+    """
+
+    MONITOR_PFS_HEALTH = True
+    PFS_HEALTH_PERIOD_S = 300.0
+
+    def __init__(self, fast=(True,), health=("engaged", "Locked in focus")):
+        self._fast = list(fast)
+        self._health = health
+        self.fast_calls = 0
+        self.health_calls = 0
+
+    def read_pfs_engaged_fast(self):
+        self.fast_calls += 1
+        return self._fast.pop(0) if len(self._fast) > 1 else self._fast[0]
+
+    def pfs_health(self):
+        self.health_calls += 1
+        return self._health
+
+
+def _monitor_engine(mic, *, started_engaged=True, warned=False, last_check=None):
+    """Engine via __new__ with just the monitor's per-run state set."""
+    import time
+    import weakref
+
+    eng = MoenchMDAEngine.__new__(MoenchMDAEngine)
+    eng._microscope_ref = weakref.ref(mic)
+    eng._pfs_started_engaged = started_engaged
+    eng._pfs_lost_lock_warned = warned
+    eng._af_reengage_after_run = False
+    # "recent" = the periodic read is not due; None = due immediately.
+    eng._pfs_last_health_check = (
+        time.monotonic() if last_check == "recent" else last_check
+    )
+    return eng
+
+
+class TestPFSHealthMonitor:
+    """The monitor pays the reload only on a transition or on the period.
+
+    Guards the staggered-schedule regression where the old once-per-timepoint
+    dedup keyed on ``t`` degenerated to one ~60 ms AF-device reload per event
+    when timepoints interleave across FOVs.
+    """
+
+    def test_quiet_event_costs_only_the_fast_probe(self):
+        mic = _PFSMic(fast=(True,))
+        eng = _monitor_engine(mic, last_check="recent")
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.fast_calls == 1
+        assert mic.health_calls == 0
+
+    def test_fast_flip_triggers_authoritative_read_and_warns(self):
+        mic = _PFSMic(fast=(False,), health=("idle", "Within range of focus search"))
+        eng = _monitor_engine(mic, last_check="recent")
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.health_calls == 1
+        assert eng._pfs_lost_lock_warned is True
+
+    def test_recovery_seen_by_probe_clears_the_warning(self):
+        mic = _PFSMic(fast=(True,), health=("engaged", "Locked in focus"))
+        eng = _monitor_engine(mic, warned=True, last_check="recent")
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.health_calls == 1
+        assert eng._pfs_lost_lock_warned is False
+
+    def test_periodic_read_catches_frozen_probe(self):
+        # Unpatched DLL: the fast probe would read a frozen True forever, so
+        # only the elapsed period gets the authoritative read to run and see
+        # the lost lock.
+        import time
+
+        mic = _PFSMic(fast=(True,), health=("idle", "Out of focus search range"))
+        eng = _monitor_engine(
+            mic, last_check=time.monotonic() - mic.PFS_HEALTH_PERIOD_S - 1
+        )
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.health_calls == 1
+        assert eng._pfs_lost_lock_warned is True
+        # the periodic clock advanced: the next event is quiet again
+        mic.health_calls = 0
+        mic._health = ("engaged", "Locked in focus")
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.health_calls == 1  # probe now disagrees with warned state
+        assert eng._pfs_lost_lock_warned is False
+
+    def test_period_zero_disables_the_periodic_read(self):
+        import time
+
+        mic = _PFSMic(fast=(True,))
+        mic.PFS_HEALTH_PERIOD_S = 0
+        eng = _monitor_engine(mic, last_check=time.monotonic() - 10_000)
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.health_calls == 0  # probe agreed; no periodic fallback
+
+    def test_gates_suppress_all_reads(self):
+        for kwargs in (
+            {"started_engaged": False},  # PFS never held focus this run
+            {},  # disabled via the flag below
+        ):
+            mic = _PFSMic()
+            if not kwargs:
+                mic.MONITOR_PFS_HEALTH = False
+            eng = _monitor_engine(mic, last_check=None, **kwargs)
+            eng._monitor_pfs_health(MDAEvent())
+            assert mic.fast_calls == 0
+            assert mic.health_calls == 0
+
+        # a Z run that deliberately disengaged the PFS is not monitored
+        mic = _PFSMic()
+        eng = _monitor_engine(mic, last_check=None)
+        eng._af_reengage_after_run = True
+        eng._monitor_pfs_health(MDAEvent())
+        assert mic.fast_calls == 0
+        assert mic.health_calls == 0

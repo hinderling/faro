@@ -552,10 +552,22 @@ class Moench(PyMMCoreMicroscope):
     )
     # If True, the engine warns when the PFS reports a fault at the start of a
     # run and, for runs that rely on the PFS to hold focus (PFS engaged and no
-    # Z commanded), when it loses lock mid-acquisition. The check reuses the
-    # ~60 ms live Status read (a non-destructive AF-device reload) once per
-    # timepoint. Set False to disable all PFS health monitoring.
+    # Z commanded), when it loses lock mid-acquisition. Monitoring is two-tier:
+    # a cheap boolean probe (read_pfs_engaged_fast, no reload) runs on every
+    # event, and the ~60 ms authoritative Status read (a non-destructive
+    # AF-device reload) runs only when the probe disagrees with the expected
+    # state or when PFS_HEALTH_PERIOD_S has elapsed since the last one. Set
+    # False to disable all PFS health monitoring; the engine re-reads this
+    # flag on every event, so it can be flipped mid-run.
     MONITOR_PFS_HEALTH: bool = True
+    # Seconds between periodic authoritative Status reads while monitoring.
+    # This is the safety net that keeps lost-lock detection working on an
+    # UNPATCHED adapter DLL, where the cheap probe reads a frozen value and
+    # never flags a transition. Time-based on purpose: it is immune to the
+    # event order, so staggered schedules with interleaved timepoints pay the
+    # same bounded cost as batch-ordered ones. None/0 disables the periodic
+    # read; transitions seen by the cheap probe still trigger one.
+    PFS_HEALTH_PERIOD_S: float = 300.0
 
     # Filter-turret verification (the "Already at position" cube-skip fix)
     # lives on MoenchCMMCorePlus, so it covers both MDA channel changes and
@@ -871,6 +883,29 @@ class Moench(PyMMCoreMicroscope):
             return None
         return status in self.PFS_ENGAGED_STATUSES
 
+    def read_pfs_engaged_fast(self) -> bool | None:
+        """Cheap engaged probe: ``isContinuousFocusEnabled()``, no reload.
+
+        With the patched Nikon adapter DLL, ``TiCOMPFS::IsEnabled()`` reports
+        the live focus status (enabled = Focusing or Locked), so this read is
+        truthful and matches the ``PFS_ENGAGED_STATUSES`` predicate at the
+        cost of one COM call. WITHOUT the patch the value is frozen at its
+        config-load state, so it never changes; callers must then rely on a
+        periodic ``pfs_health()`` read instead (see
+        ``MoenchMDAEngine._monitor_pfs_health``). Unlike ``pfs_health()``,
+        this cannot report *why* the PFS is not holding, only whether it is.
+
+        Takes the PFS lock so the read cannot hit the autofocus device while
+        another thread is reloading (and destroying) it. Returns ``None``
+        when the read fails.
+        """
+        with self._pfs_lock:
+            try:
+                return bool(self.mmc.isContinuousFocusEnabled())
+            except Exception as e:
+                logger.warning("Fast PFS engaged read failed: %s", e)
+                return None
+
     def pfs_health(self) -> tuple[str, str]:
         """Live PFS health as ``(state, status_string)``.
 
@@ -950,7 +985,7 @@ class MoenchMDAEngine(MDAEngine):
         self._warned_slow_z = False
         # Per-run PFS health monitoring (see _monitor_pfs_health).
         self._pfs_started_engaged = False
-        self._pfs_last_health_tp = None
+        self._pfs_last_health_check = None  # time.monotonic() of last Status read
         self._pfs_lost_lock_warned = False
 
     def attach_microscope(self, mic) -> None:
@@ -1158,12 +1193,15 @@ class MoenchMDAEngine(MDAEngine):
         # PFS health: one live read at run start. Records whether the PFS is
         # holding focus (so _monitor_pfs_health can watch for a lost lock on
         # runs that rely on it), and warns immediately if it reports a fault.
+        # It also starts the periodic-read clock, so the first event does not
+        # repeat this read.
         self._pfs_started_engaged = False
-        self._pfs_last_health_tp = None
+        self._pfs_last_health_check = None
         self._pfs_lost_lock_warned = False
         if mic is not None and getattr(mic, "MONITOR_PFS_HEALTH", False):
             try:
                 state, status = mic.pfs_health()
+                self._pfs_last_health_check = time.monotonic()
             except Exception as e:
                 state, status = "unknown", ""
                 logger.warning("PFS health read failed at run start: %s", e)
@@ -1244,12 +1282,24 @@ class MoenchMDAEngine(MDAEngine):
 
         Only active when the PFS was engaged at run start AND the run has not
         disengaged it for Z moves (i.e. the acquisition is trusting the PFS to
-        hold focus). Checks at most once per timepoint, reusing the live
-        ``Status`` read (~60 ms, non-destructive). A drop out of the engaged
-        states, whether to a fault ('Focus lock failed', ...) or simply out of lock
-        ('Within range of focus search'), is reported once, and a recovery
-        is noted. Runs that never engaged the PFS, or that disabled it for Z,
-        are not monitored. Disable via ``Moench.MONITOR_PFS_HEALTH = False``.
+        hold focus). Runs that never engaged the PFS, or that disabled it for
+        Z, are not monitored. Disable via ``Moench.MONITOR_PFS_HEALTH =
+        False``; the flag is re-read on every event, so it works mid-run.
+
+        Two-tier cost model. Every event pays only the cheap boolean probe
+        (``read_pfs_engaged_fast``, one COM call, no reload). The ~60 ms
+        authoritative ``Status`` read (an AF-device reload, which also carries
+        the fault reason) runs only when the probe disagrees with the expected
+        state, or when ``Moench.PFS_HEALTH_PERIOD_S`` has elapsed since the
+        last one. The periodic read is the safety net for unpatched adapter
+        DLLs, where the probe reads a frozen value and never flags anything.
+        The schedule is time-based, not timepoint-based, so staggered runs
+        with interleaved ``t`` indices pay the same bounded cost as
+        batch-ordered ones.
+
+        A drop out of the engaged states, whether to a fault ('Focus lock
+        failed', ...) or simply out of lock ('Within range of focus search'),
+        is reported once, and a recovery is noted.
         """
         mic = self.microscope
         if mic is None or not getattr(mic, "MONITOR_PFS_HEALTH", False):
@@ -1259,11 +1309,22 @@ class MoenchMDAEngine(MDAEngine):
         if self._af_reengage_after_run:
             return  # we intentionally disengaged it for this (Z) run
 
-        tp = event.index.get("t") if getattr(event, "index", None) else None
-        if tp == self._pfs_last_health_tp:
-            return  # already checked this timepoint
-        self._pfs_last_health_tp = tp
+        now = time.monotonic()
+        period = float(getattr(mic, "PFS_HEALTH_PERIOD_S", 0) or 0)
+        due = self._pfs_last_health_check is None or (
+            period > 0 and now - self._pfs_last_health_check >= period
+        )
+        if not due:
+            # Cheap probe: authoritative read only on an apparent transition.
+            expected_engaged = not self._pfs_lost_lock_warned
+            try:
+                fast = mic.read_pfs_engaged_fast()
+            except Exception:
+                fast = None
+            if fast is None or fast == expected_engaged:
+                return
 
+        self._pfs_last_health_check = now
         try:
             state, status = mic.pfs_health()
         except Exception as e:
