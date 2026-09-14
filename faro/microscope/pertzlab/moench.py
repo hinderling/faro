@@ -1114,6 +1114,98 @@ class Moench(PyMMCoreMicroscope):
         """
         return bool(getattr(self, "pfs_on_at_init", False))
 
+    def make_pfs_widget(
+        self,
+        *,
+        poll_interval_ms: int = 3000,
+        skip_during_mda: bool = True,
+        write_settle_s: float = 2.0,
+    ):
+        """Build a napari-dockable continuous-focus widget for this scope.
+
+        Returns a ``pymmcore_widgets.ContinuousFocusWidget`` wired to Moench's
+        live PFS reads, so the indicator tracks the true state, including
+        changes made at the hardware PFS button. Those changes are invisible to
+        the cached ``isContinuousFocusEnabled``/``State`` values.
+
+        The widget calls three status sources on every poll. Here they all
+        share one ``pfs_health()`` snapshot (one ~60 ms AF-device reload)
+        through a short TTL cache.
+
+        The reload destroys and rebuilds the AF device object, and on the Ti
+        that aborts the whole process if it happens at the wrong moment. So the
+        snapshot is skipped, and the last value kept, in three cases:
+
+        * while an MDA is running (the engine thread uses the core);
+        * while a live acquisition is running (``KeepDMDAlive`` calls into the
+          core from its own thread);
+        * for ``write_settle_s`` after the widget wrote the PFS on or off (the
+          adapter is still settling the write on its COM thread; reloading
+          then is what crashed the first napari session).
+
+        The widget's own button write is routed through ``_pfs_lock`` and
+        timestamped so the settle guard sees it.
+        """
+        from pymmcore_widgets import ContinuousFocusWidget  # optional UI dep
+
+        ttl = max(0.2, poll_interval_ms / 1000.0 * 0.5)
+        cache = {
+            "t": -ttl,
+            "engaged": None,
+            "text": "unknown",
+            "last_write": -write_settle_s,
+        }
+
+        def _reload_is_safe(now: float) -> bool:
+            if now - cache["last_write"] < write_settle_s:
+                return False
+            if skip_during_mda and self.mmc.mda.is_running():
+                return False
+            try:
+                if self.mmc.isSequenceRunning():
+                    return False
+            except Exception:
+                return False
+            return True
+
+        def _set_enabled(on: bool) -> None:
+            with self._pfs_lock:
+                self.mmc.enableContinuousFocus(on)
+                cache["last_write"] = time.monotonic()
+
+        def _snapshot() -> None:
+            now = time.monotonic()
+            if now - cache["t"] < ttl:
+                return
+            if not _reload_is_safe(now):
+                return
+            state, status = self.pfs_health()
+            cache["t"] = now
+            cache["engaged"] = None if state == "unknown" else (state == "engaged")
+            cache["text"] = status or state
+
+        def _engaged() -> bool:
+            _snapshot()
+            return bool(cache["engaged"])
+
+        def _text() -> str:
+            _snapshot()
+            return str(cache["text"])
+
+        # On the Ti "enabled" and "locked" collapse to one truthful signal:
+        # engaged means Locked in focus or Focusing.
+        # Let the widget re-read a little after the settle guard lifts, so the
+        # first refresh after a click actually reloads instead of being skipped.
+        return ContinuousFocusWidget(
+            mmcore=self.mmc,
+            enabled_source=_engaged,
+            locked_source=_engaged,
+            status_text_source=_text,
+            poll_interval_ms=poll_interval_ms,
+            set_enabled=_set_enabled,
+            toggle_settle_ms=int(write_settle_s * 1000) + 250,
+        )
+
     def disable_log_output(self):
         """Opt-in: silence noisy third-party loggers (matplotlib, ...).
 
