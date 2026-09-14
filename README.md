@@ -62,7 +62,7 @@ handle.wait()  # run_experiment is non-blocking; wait() blocks until done
 | [`templates/reanalysis/`](templates/reanalysis/) | Copy-and-fill folder to re-process an experiment that is already on disk. |
 | [`templates/README.md`](templates/README.md) | How to copy a template, `uv sync`, pin faro to a commit, update the pin, and work against a local checkout. |
 
-The virtual microscope is part of the base install, so the example and the templates run right after `uv sync`. The test suite executes them on it, so they always match the code. Real experiments live in the separate [faro-experiments](https://github.com/pertzlab/faro-experiments) repository: one folder per experiment, each pinned to a faro commit.
+The virtual microscope ([virtual-microscope-teaching](https://github.com/hinderling/virtual-microscope-teaching), a small pure-Python simulator of light-responsive cells behind the pymmcore-plus API) is part of the base install, so the example and the templates run right after `uv sync`. The test suite executes them on it, so they always match the code. Real experiments live in the separate [faro-experiments](https://github.com/pertzlab/faro-experiments) repository: one folder per experiment, each pinned to a faro commit.
 
 ## Pipeline
 

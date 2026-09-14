@@ -21,7 +21,7 @@ import pytest
 
 nbformat = pytest.importorskip("nbformat")
 nbclient = pytest.importorskip("nbclient")
-pytest.importorskip("virtual_microscope")
+pytest.importorskip("vmteach")
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -216,7 +216,7 @@ def test_reanalysis_template_runs(tmp_dir):
 
 
 def _make_source_run(path: Path) -> Path:
-    from virtual_microscope.backends.optogenetic import setup_optogenetic
+    from vmteach import load_microscope
 
     from faro.core.controller import Controller
     from faro.core.data_structures import RTMSequence, SegmentationMethod
@@ -227,7 +227,7 @@ def _make_source_run(path: Path) -> Path:
     from faro.segmentation.base import OtsuSegmentator
     from faro.tracking.trackpy import TrackerTrackpy
 
-    core, _ = setup_optogenetic(n_cells=15)
+    core, _ = load_microscope("optogenetic", mode="realtime")
     mic = UniMMCoreSimulation(mmc=core)
     mic.init_scope()
     path = Path(path)
@@ -243,7 +243,7 @@ def _make_source_run(path: Path) -> Path:
         RTMSequence(
             time_plan={"interval": 0.3, "loops": 3},
             stage_positions=[{"x": 0.0, "y": 0.0, "z": 0.0}],
-            channels=[{"config": "phase-contrast", "exposure": 50}],
+            channels=[{"config": "DAPI", "exposure": 50}],
         )
     )
     ctrl = Controller(mic, pipeline, writer=OmeZarrWriter(storage_path=str(path)))

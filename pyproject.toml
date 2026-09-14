@@ -24,7 +24,7 @@ dependencies = [
     # Pure-Python simulated microscope (brings numba and opencv). A base
     # dependency so the example notebook and the templates run right after
     # `uv sync`, without hardware or Micro-Manager.
-    "virtual-microscope",
+    "virtual-microscope-teaching",
 ]
 
 [project.optional-dependencies]
@@ -99,7 +99,7 @@ conflicts = [
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
-virtual-microscope = { git = "https://github.com/hinderling/virtual-microscope.git" }
+virtual-microscope-teaching = { git = "https://github.com/hinderling/virtual-microscope-teaching.git" }
 # The pertzlab integration branch: upstream main + the lab's stage map,
 # tweaks and in-flight upstream fixes. See PERTZLAB.md on that branch.
 pymmcore-widgets = { git = "https://github.com/pertzlab/pymmcore-widgets.git", branch = "pertzlab" }
