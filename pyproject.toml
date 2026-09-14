@@ -21,6 +21,10 @@ dependencies = [
     "ome-writers",
     "napari-ome-zarr",
     "zarr>=3",
+    # Pure-Python simulated microscope (brings numba and opencv). A base
+    # dependency so the example notebook and the templates run right after
+    # `uv sync`, without hardware or Micro-Manager.
+    "virtual-microscope-teaching",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +36,7 @@ test = [
     # one (trackpy is a core dep).
     "faro[motile]",
     "nbformat",
+    "nbclient>=0.11.0",
 ]
 
 motile = [
@@ -54,8 +59,7 @@ cellpose = [
     # source overrides for packages declared as direct deps).
     "torchvision",
     # cellpose imports cv2 but doesn't pin opencv itself; declare it here
-    # so the cellpose extra is self-sufficient (was only pulled in
-    # transitively via the virtual-microscope extra before).
+    # so the cellpose extra is self-sufficient.
     "opencv-python",
     ]
 
@@ -68,12 +72,6 @@ remote-segmentation = [
     "imaging-server-kit",
 ]
 
-
-virtual-microscope = [
-    "virtual-microscope",
-    "opencv-python",
-    "imageio[ffmpeg]"
-]
 
 api74 = [
     "pymmcore==11.10.0.74.1"
@@ -101,7 +99,7 @@ conflicts = [
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
-virtual-microscope = { git = "https://github.com/hinderling/virtual-microscope.git" }
+virtual-microscope-teaching = { git = "https://github.com/hinderling/virtual-microscope-teaching.git" }
 # The pertzlab integration branch: upstream main + the lab's stage map,
 # tweaks and in-flight upstream fixes. See PERTZLAB.md on that branch.
 pymmcore-widgets = { git = "https://github.com/pertzlab/pymmcore-widgets.git", branch = "pertzlab" }
@@ -113,6 +111,7 @@ napari-micromanager = { git = "https://github.com/pymmcore-plus/napari-micromana
 [tool.pytest.ini_options]
 markers = [
     "hardware: requires a real Pertzlab microscope (selected via --scope or FARO_SCOPE env var). Skipped by default.",
+    "examples: executes the example notebooks and templates on the virtual microscope (slow).",
 ]
 
 [build-system]

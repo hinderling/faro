@@ -19,8 +19,19 @@ warnings.filterwarnings(
 import numpy as np
 from useq import MDAEvent
 
+from faro.core.data_structures import Channel
 from faro.core.dmd import DMD
 
+
+def as_channel(channel) -> Channel:
+    """Coerce a config name or a channel dict to a ``Channel``; pass Channels through."""
+    if isinstance(channel, Channel):
+        return channel
+    if isinstance(channel, str):
+        return Channel(config=channel)
+    if isinstance(channel, dict):
+        return Channel(**channel)
+    raise TypeError(f"expected a Channel, a channel dict or a config name, got {type(channel).__name__}")
 
 class AbstractMicroscope:
     """Base class defining the microscope interface.
@@ -127,9 +138,14 @@ class AbstractMicroscope:
     # ------------------------------------------------------------------
 
     def calibrate_dmd(self, calibration_channel):
-        """Calibrate the DMD. Always runs the calibration when called."""
+        """Calibrate the DMD. Always runs the calibration when called.
+
+        ``calibration_channel`` is a ``Channel``/``PowerChannel``, a channel
+        dict (``{"config": ..., "exposure": ...}``) or a config name. Does
+        nothing on a scope without a DMD.
+        """
         if isinstance(self.dmd, DMD):
-            self.dmd.calibrate(calibration_channel)
+            self.dmd.calibrate(as_channel(calibration_channel))
 
     def post_experiment(self):
         """Post-process the experiment. Optional override."""

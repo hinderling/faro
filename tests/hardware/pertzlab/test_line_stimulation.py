@@ -1,6 +1,6 @@
 """Hardware smoke test: end-to-end line-stimulation acquisition.
 
-Converted from ``experiments/22_line_stimulation/line_stimulation.ipynb``.
+Converted from ``22_line_stimulation/line_stimulation.ipynb`` in pertzlab/faro-experiments.
 Runs a short multi-FOV / multi-timestep acquisition with a moving-line
 DMD pattern. No segmentation, tracking, or feature extraction — this
 exercises the geometric ``StimLine`` path on its own. The optocheck

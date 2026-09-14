@@ -29,6 +29,7 @@ are auto-skipped without `--scope <moench|niesen|jungfrau>` (or
 | `test_validate_hardware.py` | Pre-flight `validate_hardware` checks (channel existence, exposure/power limits). |
 | `hardware/pertzlab/test_pertzlab_unit.py` | Pertzlab-specific unit tests (power-property detection, `MoenchCMMCorePlus` position-confirmed stage waits). Uses fakes; drives no hardware. |
 | `test_event_ordering.py` | `RTMSequence.iter_events` axis-order semantics. |
+| `test_examples.py` | Executes `examples/live_experiment.ipynb` and both `templates/` notebooks on the virtual microscope (run verbatim with small frame counts; `gui` cells dropped; the re-analysis paths cell swapped for a generated source run); checks README anchors the notebooks link to. Marker `examples`. |
 | `test_events_to_dataframe.py` | Event-list → DataFrame serialization. |
 | `test_frame_dispenser.py` | Concurrent put/get primitives used by the pipeline threads. |
 

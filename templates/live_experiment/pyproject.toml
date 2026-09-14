@@ -1,0 +1,19 @@
+[project]
+name = "my-experiment"            # rename: lowercase, hyphens, no spaces
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    # faro's own git sources (pertzlab pymmcore-widgets, napari-micromanager
+    # main, the virtual microscope) and index pins carry over to this project.
+    "faro",
+    # "jupyterlab",   # uncomment if you run notebooks with Jupyter rather than VS Code
+    # Add faro extras you need, for example:
+    # "faro[cellpose]",
+    # "faro[stardist]",
+]
+
+[tool.uv.sources]
+# Pick ONE of the three lines below (see templates/README.md in the faro repository).
+faro = { git = "https://github.com/pertzlab/faro.git", branch = "main" }
+# faro = { git = "https://github.com/pertzlab/faro.git", rev = "0123456789abcdef0123456789abcdef01234567" }
+# faro = { path = "../../faro", editable = true }

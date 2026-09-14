@@ -22,12 +22,13 @@ Pipeline   <-->  Controller   <-->   Microscope
 
 ## Quickstart
 
-Try **`experiments/02_demo_sim_optogenetic/`** notebook to run a complete optogenetic feedback experiment on a simulated microscope, no hardware required.
+Run [`examples/live_experiment.ipynb`](examples/live_experiment.ipynb) for a complete optogenetic feedback experiment on a virtual microscope. No hardware needed.
 
 ```python
 # 1. Set microscope
 mic = UniMMCoreSimulation(mmc=mmc)
 mic.init_scope()
+mic.calibrate_dmd("Cyan")   # scopes with a DMD: once per session, on an empty field
 
 # 2. Assemble image processing pipeline
 pipeline = ImageProcessingPipeline(
@@ -35,7 +36,7 @@ pipeline = ImageProcessingPipeline(
     segmentators=[SegmentationMethod("labels", OtsuSegmentator(), use_channel=0, save_tracked=True)],
     feature_extractor=SimpleFE("labels"),
     tracker=TrackerTrackpy(),
-    stimulator=MoveUp(),
+    stimulator=StimWholeFOV(),  # or your own, see Writing your own components
 )
 
 # 3. Define experiment parameters
@@ -52,6 +53,17 @@ ctrl = Controller(mic, pipeline)
 handle = ctrl.run_experiment(list(events), stim_mode="current")
 handle.wait()  # run_experiment is non-blocking; wait() blocks until done
 ```
+
+## Examples and templates
+
+| Path | What it is |
+|------|------------|
+| [`examples/live_experiment.ipynb`](examples/live_experiment.ipynb) | A full feedback experiment on a virtual microscope: the four objects, custom pipeline components, three phases, napari GUI, result plots. |
+| [`templates/live_experiment/`](templates/live_experiment/) | Copy-and-fill folder for a real experiment: notebook with TODO cells that runs on the virtual microscope as shipped, plus a `pyproject.toml` that pins faro. |
+| [`templates/reanalysis/`](templates/reanalysis/) | Copy-and-fill folder to re-process an experiment that is already on disk. |
+| [`templates/README.md`](templates/README.md) | How to copy a template, `uv sync`, pin faro to a commit, update the pin, and work against a local checkout. |
+
+The virtual microscope ([virtual-microscope-teaching](https://github.com/hinderling/virtual-microscope-teaching), a small pure-Python simulator of light-responsive cells behind the pymmcore-plus API) is part of the base install, so the example and the templates run right after `uv sync`. The test suite executes them on it, so they always match the code. Real experiments live in the separate [faro-experiments](https://github.com/pertzlab/faro-experiments) repository: one folder per experiment, each pinned to a faro commit.
 
 ## Pipeline
 
@@ -74,13 +86,99 @@ pipeline = ImageProcessingPipeline(
     feature_extractor_ref=ref_fe,  # optional: for reference acquisition frames
 )
 ```
+
+## Writing your own components
+
+Every component is a small class with one method. The pipeline calls that method once per frame and merges the result. `validate_events` compares your method signature with the base class before a run starts, so keep the argument names. The [live experiment example](examples/live_experiment.ipynb) implements one of each.
+
+### Segmentator
+
+```python
+import numpy as np
+from faro.segmentation.base import Segmentator
+
+class MySegmentator(Segmentator):
+    def segment(self, image: np.ndarray) -> np.ndarray:
+        # image: (y, x) for use_channel=int, or (c, y, x) for use_channel=list
+        # return: integer label image, same (y, x) shape, 0 = background
+        ...
+```
+
+Register it under a name: `SegmentationMethod("labels", MySegmentator(), use_channel=0, save_tracked=True)`. Several methods can run on the same frame, for example nuclei and whole cells. Other components refer to a segmentation by its name.
+
+### Tracker
+
+```python
+import pandas as pd
+from faro.tracking.base import Tracker
+
+class MyTracker(Tracker):
+    def track_cells(self, df_old: pd.DataFrame, df_new: pd.DataFrame, fov_state) -> pd.DataFrame:
+        # df_old: all rows tracked so far for this field of view
+        # df_new: this frame's detections with columns label, x, y
+        # fov_state: per-FOV scratch space that survives between frames
+        # return: df_old plus df_new, every row with a "particle" id
+        ...
+```
+
+`TrackerTrackpy` and `TrackerMotile` cover most needs. Write your own only if you need a different linking model.
+
+### FeatureExtractor
+
+```python
+import pandas as pd
+from skimage.measure import regionprops_table
+from faro.feature_extraction.base import FeatureExtractor
+
+class MyFE(FeatureExtractor):
+    def __init__(self, used_mask: str):
+        self.used_mask = used_mask     # name of the segmentation to measure
+        super().__init__()
+
+    def extract_features(self, labels: dict, image, df_tracked=None, metadata=None):
+        # labels: {segmentation name: label image}
+        # image: (c, y, x) stack of the imaging channels
+        # return: (DataFrame with a "label" column plus your features, None)
+        table = regionprops_table(labels[self.used_mask], intensity_image=image[0],
+                                  properties=["label", "area", "mean_intensity"])
+        return pd.DataFrame(table), None
+```
+
+The pipeline joins the returned columns onto the tracks by `label`. The second return value is reserved for masks that a reference-frame extractor needs; return `None` unless you use reference acquisitions.
+
+### Stimulator
+
+Pick the base class by what the decision needs:
+
+| Base class | `get_stim_mask` receives |
+|------------|--------------------------|
+| `Stim` | `metadata` only (`img_shape`, `timestep`, `fov`, your `rtm_metadata`) |
+| `StimWithImage` | `metadata`, `img` |
+| `StimWithPipeline` | `label_images`, `metadata`, `img`, `tracks` |
+
+```python
+import numpy as np
+from faro.stimulation.base import StimWithPipeline
+
+class MyStim(StimWithPipeline):
+    required_metadata = {"stim_fraction"}   # keys that must be in rtm_metadata
+
+    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
+        # return: (uint8 mask of shape metadata["img_shape"], anything you want logged)
+        mask = np.zeros(metadata["img_shape"], dtype=np.uint8)
+        ...
+        return mask, None
+```
+
+`tracks` holds the tracked DataFrame up to the current frame, so a stimulator can treat cells differently by `particle` id or by a feature value. Return `True` instead of a mask to illuminate the whole field of view.
+
 ## Controller
 
 The Controller converts RTMEvents to MDAEvents, queues them through the microscope, and dispatches frames to the pipeline.
 
 ### Experiment Definition
 
-Experiments are defined as `RTMSequence` objects — an extension of useq's `MDASequence`. Compose multi-step experiments with `combine()`, which supports two modes of composition via the `axis` argument:
+Experiments are defined as `RTMSequence` objects, an extension of useq's `MDASequence`. Compose multi-step experiments with `combine()`, which supports two modes of composition via the `axis` argument:
 
 ```python
 from faro.core.data_structures import Channel, PowerChannel, RTMSequence, combine
@@ -104,7 +202,7 @@ washout = RTMSequence(...)
 events = combine(baseline, treatment, washout, axis="t")
 ```
 
-**Parallel sub-experiments (`axis="p"`).** Two (or more) setups running concurrently on different subsets of FOVs — useful when FOVs need different stim patterns, different stim schedules, or different treatment metadata, but should share the clock. Each sub-experiment keeps its own `stim_frames` and `rtm_metadata`:
+**Parallel sub-experiments (`axis="p"`).** Two (or more) setups running concurrently on different subsets of FOVs. This is useful when FOVs need different stim patterns, different stim schedules, or different treatment metadata, but should share the clock. Each sub-experiment keeps its own `stim_frames` and `rtm_metadata`:
 
 ```python
 setup_a = RTMSequence(
@@ -126,14 +224,14 @@ setup_b = RTMSequence(
 
 events = combine(setup_a, setup_b, axis="p")
 # At each timepoint: FOVs 0-4 image with setup_a's stim schedule,
-# FOVs 5-9 image with setup_b's — all in parallel on the same clock.
+# FOVs 5-9 image with setup_b's, all in parallel on the same clock.
 ```
 
 **Precondition for `axis="p"`:** all sub-experiments must declare the same imaging channels. The writer allocates a single channel set across all positions, so heterogeneous channels per FOV are not supported today (tracked for the eventual useq-schema v2 migration). A `ValueError` is raised at call time if channel configs differ.
 
-`combine()` is variadic (`combine(a, b, c, d, ..., axis=...)`), handles the N=0 and N=1 degenerate cases, and is the only composition primitive — there is deliberately no shorthand operator, so every multi-step experiment reads the composition axis explicitly.
+`combine()` is variadic (`combine(a, b, c, d, ..., axis=...)`), handles the N=0 and N=1 degenerate cases, and is the only composition primitive. There is deliberately no shorthand operator, so every multi-step experiment reads the composition axis explicitly.
 
-**Timed waits between phases.** `wait(seconds)` inserts a fixed-duration pause — e.g. to let cells recover before stimulating. It acquires no frames and just delays everything after it:
+**Timed waits between phases.** `wait(seconds)` inserts a fixed-duration pause, for example to let cells recover before stimulating. It acquires no frames and just delays everything after it:
 
 ```python
 from faro.core.data_structures import wait
@@ -161,7 +259,7 @@ seq = RTMSequence(
 
 ### Reference Acquisition
 
-Reference channels are acquired on specific frames for one-time measurements whose features are broadcast to all timepoints — e.g., checking expression of an optogenetic tool, or a high-resolution image that would bleach the sample. Define them with `ref_channels` and `ref_frames`:
+Reference channels are acquired on specific frames for one-time measurements whose features are broadcast to all timepoints, for example checking expression of an optogenetic tool, or a high-resolution image that would bleach the sample. Define them with `ref_channels` and `ref_frames`:
 
 ```python
 seq = RTMSequence(
@@ -189,8 +287,8 @@ events = combine(experiment, ref_phase, axis="t")
 ### Frame Specification
 
 Both `stim_frames` and `ref_frames` accept:
-* **Sets**: `{0, 5, 10}` — specific frames
-* **Ranges**: `range(10, 50)` or `range(0, 50, 2)` — contiguous or strided
+* **Sets**: `{0, 5, 10}` for specific frames
+* **Ranges**: `range(10, 50)` or `range(0, 50, 2)` for contiguous or strided frames
 * **Negative indices**: `-1` = last frame, `-2` = second-to-last
 
 ### Axis Order
@@ -248,9 +346,19 @@ handle = ctrl.run_experiment(events, stim_mode="current")
 handle.wait()  # block until the run finishes
 ```
 
-`validate_events()` runs automatically before the experiment starts (disable with `validate=False`). It checks both pipeline compatibility and hardware limits.
+### Validation
 
-`run_experiment()` and `continue_experiment()` are **non-blocking** — they return a `RunHandle` so the kernel stays free (e.g. to use the napari viewer). Call `handle.wait()` to block until the run finishes.
+`ctrl.validate_events(events)` runs before every experiment (`validate=False` skips it) and returns `False` with one warning per problem. Fix every warning before you start. It checks:
+
+- **Signatures**: each segmentator, tracker, feature extractor and stimulator accepts the arguments of its base-class method.
+- **Required metadata**: every key a component lists in `required_metadata` is present in the event metadata (`rtm_metadata`).
+- **Phases**: events with `phase_name` also carry `phase_id`, which names the per-phase tracks file.
+- **Channels**: every imaging and stimulation config exists in a Micro-Manager config group.
+- **Exposure**: within the camera's limits.
+- **Power**: `PowerChannel.power` within the range of the device property.
+- **DMD**: calibrated whenever the events contain stimulation channels.
+
+`run_experiment()` and `continue_experiment()` are **non-blocking**: they return a `RunHandle` so the kernel stays free (e.g. to use the napari viewer). Call `handle.wait()` to block until the run finishes.
 
 ```python
 handle = ctrl.run_experiment(events, stim_mode="current")
@@ -274,7 +382,7 @@ Call `run_experiment()` once, then `continue_experiment()` to append more phases
 ```python
 ctrl = Controller(mic, pipeline)
 
-# Phase 1: baseline — find cells, measure growth rate
+# Phase 1: baseline. Find cells, measure growth rate
 phase1 = RTMSequence(time_plan={"interval": 10, "loops": 60}, ...)
 ctrl.run_experiment(phase1, validate=False).wait()  # wait() before reading results
 
@@ -299,10 +407,10 @@ ctrl.extend_experiment(extra_events)                   # non-blocking, appends t
 
 | Method | When to use | Returns |
 |--------|-------------|---------|
-| `run_experiment()` | First acquisition — creates a fresh Analyzer | `RunHandle` (non-blocking) |
-| `continue_experiment()` | Subsequent phases — reuses Analyzer, offsets timesteps | `RunHandle` (non-blocking) |
-| `extend_experiment()` | Mid-run additions — pushes events into the running loop | — (non-blocking) |
-| `finish_experiment()` | Cleanup — shuts down Analyzer, resets state | — (blocks until drained) |
+| `run_experiment()` | First acquisition, creates a fresh Analyzer | `RunHandle` (non-blocking) |
+| `continue_experiment()` | Subsequent phases, reuses Analyzer, offsets timesteps | `RunHandle` (non-blocking) |
+| `extend_experiment()` | Mid-run additions, pushes events into the running loop | None (non-blocking) |
+| `finish_experiment()` | Cleanup, shuts down Analyzer, resets state | None (blocks until drained) |
 
 ## Simulated Controller
 
@@ -318,15 +426,15 @@ ctrl.run_experiment(events, stim_mode="current").wait()
 ```
 
 Use cases:
-- **Testing**: run the full pipeline on demo data without any microscope hardware
+- **Testing**: run the full pipeline on previously acquired data without any microscope hardware
 - **Re-analysis**: replay raw images through a new pipeline (different segmentation, tracking, etc.)
 - **Validation**: verify analysis logic reproducibly on known data
 
-See **`experiments/11_erk_experiments_full_fov_stim/stim_rtmsequence_demo_mic.ipynb`** for a working example.
+For re-processing without hardware, see [Re-analysis](#re-analysis) below.
 
 ## Re-analysis
 
-The offline re-analysis pipeline (`ImageProcessingPipeline_postExperiment`) reprocesses images from a previous experiment with new segmentation, tracking, or feature extraction parameters — without re-acquiring.
+The offline re-analysis pipeline (`ImageProcessingPipeline_postExperiment`) reprocesses images from a previous experiment with new segmentation, tracking, or feature extraction parameters, without re-acquiring.
 
 ```python
 from faro.core.pipeline_post import ImageProcessingPipeline_postExperiment
@@ -350,7 +458,7 @@ Key features:
 - **Hard-linking**: when outputting to OME-Zarr, raw data resolution levels are hard-linked instead of copied (falls back to copy on network shares)
 - **Timestep gap correction**: `correct_timestep_jumps=True` backfills missing timesteps
 
-See **`experiments/90_reanalysis/reanalysis.ipynb`** for a complete example.
+The [re-analysis template](templates/reanalysis/) is a copy-and-fill notebook for this pipeline.
 
 ## Storage
 
@@ -396,7 +504,7 @@ pipeline = ImageProcessingPipeline(
 )
 ```
 
-The stream is initialized automatically by the Controller before the first frame is written — no manual setup required.
+The stream is initialized automatically by the Controller before the first frame is written. No manual setup is required.
 
 ### OmeZarrWriterPlate (plate layout)
 
@@ -571,25 +679,28 @@ This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
 git clone https://github.com/pertzlab/faro.git
 cd faro
 uv sync
+uv run --no-sync --with jupyterlab jupyter lab examples/live_experiment.ipynb
 ```
+
+The second line opens the [example notebook](examples/live_experiment.ipynb) in Jupyter (VS Code with the `.venv` interpreter works as well). It runs on the bundled virtual microscope, so no hardware or Micro-Manager install is needed. For your own experiments, start from a [template](templates/) instead of working inside this repository.
 
 ### Extras
 
-Optional dependency groups are available for segmentation backends and simulation:
+Optional dependency groups are available for segmentation backends and testing:
 
 | Extra | Packages | Use case |
 |-------|----------|----------|
 | `cellpose` | cellpose, torch | Cellpose segmentation |
 | `stardist` | stardist, tensorflow, csbdeep | StarDist segmentation |
 | `convpaint` | napari-convpaint, scipy | ConvPaint segmentation |
-| `virtual_microscope` | virtual-microscope | Fully simulated microscope with synthetic cell images. For a quick demo, the built-in Micro-Manager demo adapter works without this extra. |
+| `test` | pytest, nbclient, motile | Run the test suite, including the notebook tests. |
 
 Install one or more extras with `uv sync`:
 
 ```bash
 uv sync --extra cellpose
 uv sync --extra cellpose --extra stardist
-uv sync --extra virtual_microscope
+uv sync --extra test
 ```
 
 Alternatively, with pip (installs the package with all its dependencies):

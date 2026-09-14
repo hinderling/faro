@@ -1,6 +1,6 @@
 """Hardware smoke test: end-to-end cell migration acquisition.
 
-Converted from ``experiments/21_cell_migration/cell_migration.ipynb``.
+Converted from ``21_cell_migration/cell_migration.ipynb`` in pertzlab/faro-experiments.
 Runs a short multi-FOV / multi-timestep acquisition with cellpose
 segmentation, trackpy tracking, ``StimPercentageOfCell`` DMD
 stimulation, and an optocheck reference channel on the last frame

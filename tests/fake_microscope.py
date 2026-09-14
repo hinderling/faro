@@ -18,9 +18,20 @@ Scene-specific state lives on ``mic.scene``.
 from __future__ import annotations
 
 from faro.microscope.pymmcore import PyMMCoreMicroscope
-from faro.microscope.simulation import SimDMD
 
 from tests.fake_mmc import Scene, build_core
+
+
+class SimDMD:
+    """Identity DMD stand-in: camera and SLM share one coordinate space, so
+    ``affine_transform`` is the identity and no calibration is needed."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.affine = True  # always "calibrated"
+
+    def affine_transform(self, mask):
+        return mask
 
 
 class FakeMicroscope(PyMMCoreMicroscope):
