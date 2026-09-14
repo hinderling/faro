@@ -28,6 +28,7 @@ Run [`examples/live_experiment.ipynb`](examples/live_experiment.ipynb) for a com
 # 1. Set microscope
 mic = UniMMCoreSimulation(mmc=mmc)
 mic.init_scope()
+mic.calibrate_dmd("Cyan")   # scopes with a DMD: once per session, on an empty field
 
 # 2. Assemble image processing pipeline
 pipeline = ImageProcessingPipeline(
