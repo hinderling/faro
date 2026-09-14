@@ -2,6 +2,8 @@
 
 Copy-and-fill notebooks for real work. Each folder is a complete uv project: copy it into your experiments repository, rename it, run `uv sync`, and work through the cells marked **TODO**. The live experiment template runs end to end on the virtual microscope as shipped, so run it once to check your environment, then replace the defaults in the TODO cells; each lists the real-scope alternatives as comments. The re-analysis template only needs its paths cell filled in. Everything else works as it is.
 
+Each folder also has a `custom.py` for the segmentator, feature extractor or stimulator that only this experiment needs. Write them there rather than in notebook cells, so the re-analysis notebook can import the same classes and they can be tested; the pipeline cell shows the import. When a class is needed by a second experiment, move it into faro and pin the commit that has it.
+
 | Folder | Use it for |
 |--------|------------|
 | `live_experiment/` | A feedback or plain timelapse experiment on a real microscope. Same structure as the [live experiment example](../examples/live_experiment.ipynb), which runs on a virtual microscope and explains every step. |
