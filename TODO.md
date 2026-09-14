@@ -14,23 +14,38 @@ haven't fixed yet.
 
 ---
 
-## 1. Exclude `Mosaic3` from `waitForDevice` (performance / Moench)
+## 1. Stuck stage/DMD `Busy()` wastes ~5 s per move (performance / Moench)
 
-**Status.** Fixed via a `SKIP_WAIT_DEVICES: tuple[str, ...]` class
-attribute on `Moench` that `MoenchMDAEngine._wait_for_system_excluding_xy`
-consults via the engine's microscope weakref. Moench declares
-`SKIP_WAIT_DEVICES = ("Mosaic3",)`. Unit-tested in
-`tests/test_hardware_pertzlab.py::TestSkipWaitDevices`. Verification
-of the actual time saved on a cell-migration test run is still
-pending — expected savings 60-100 s on a 280 s test (5 s per event
-× ~12-20 events that hit the wait path).
+**Status: fixed.** On the Nikon Ti the `TIXYDrive`/`TIZDrive` `Busy()`
+flag rides to a multi-second safety cap on every move (the completion
+signal is not delivered in-process), and the `Mosaic3` DMD's `Busy()`
+is likewise stuck, so `waitForSystem()` wasted ~5 s per stage move.
 
-**Upstream follow-up.** A more general per-device timeout primitive
-on `CMMCorePlus.waitForDevice(dev, timeout_ms=X)` — where
-`timeout_ms=0` collapses to "check Busy() once, fail fast" — would
-replace the skip-list with a cleaner device-neutral knob. See
-`../pymmcore-plus/TODO.md` for the full proposal and MMCore C++
-source references.
+Fixed with `MoenchCMMCorePlus` (a `CMMCorePlus` subclass): it records
+the commanded target on `set(Relative)(XY/Z)Position` and, in
+`waitForDevice`/`waitForSystem`, confirms the XY/focus stages by
+polling position against that target instead of blocking on `Busy()`,
+and skips `Mosaic3`. This lives on the core object so both
+`MoenchMDAEngine` and napari-micromanager's interactive moves (sharing
+the same core) get the fast, correct wait. Unit-tested in
+`tests/hardware/pertzlab/test_pertzlab_unit.py::TestMoenchCorePositionConfirm`.
+Measured on-scope: stage `waitForSystem` ~0.2 s vs the old ~5 s.
+
+### Revisit: upstream may now fix this at the adapter level
+
+Micro-Manager fixed the Nikon Ti XY `Busy`-too-soon bug in the (private)
+Nikon adapter repo in Feb 2026 (mmCoreAndDevices #826), and added a
+device API letting a stage declare whether it fires position callbacks
+(#808, merged as #861, 2026-02-26). Our adapter is the `api75` build
+dated 2026-03-22 and still shows the stuck `Busy`, so either the fix is
+not in it or it needs the newer interface.
+
+Action: install a current MM nightly, drop its stock
+`mmgr_dal_NikonTI.dll` on the scope, and check whether XY/Z `Busy` now
+reports correctly (and whether the stage declares callbacks). If it
+does, `MoenchCMMCorePlus`'s position-confirm can be reduced to a
+fallback or removed. Watch the device-interface bump (`api75` to a
+newer version) for faro/pymmcore compatibility before switching.
 
 ---
 
@@ -136,15 +151,15 @@ docstring claims "about a minute". User target is **≤ 3 min**.
 
 **What drives the time.**
 
-- `waitForDevice(Mosaic3)` ~60 s (see #1)
+- Stuck stage/DMD `Busy()` waits (fixed, see #1)
 - First-frame stim mask timeout ~80 s (see #2)
 - Cellpose GPU model load ~20–30 s
 - 4 frames × 5 s time plan = 20 s
 - Rest: imaging, stage, ref frames, teardown
 
-Fixing #1 + #2 should drop this to ~90–120 s, comfortably inside 3
-min. Until then, consider marking the test as `@pytest.mark.slow` so
-it isn't blocking on the 3-min budget.
+With #1 fixed, resolving #2 should drop this to ~90–120 s, comfortably
+inside 3 min. Until then, consider marking the test as
+`@pytest.mark.slow` so it isn't blocking on the 3-min budget.
 
 ---
 
@@ -205,3 +220,96 @@ touch camera geometry properties (Binning, ROI, PixelSize).
   (visible in `assertion output`). That's noisy — consider
   formatting only the exception type + message in the assertion
   string and logging the full tracebacks separately.
+
+---
+
+## 6. Nikon adapter DLL patch (readfix): required for fast Z
+
+**Status: applied on the Moench.** Must be re-applied after any
+Micro-Manager reinstall or nightly update (they replace the adapter).
+
+**What it fixes.** The `NikonTI` adapter serves the PFS enabled state
+from a value cached at device Initialize, so `isContinuousFocusEnabled()`
+/ `State` go stale, `enableContinuousFocus()` only lands once per
+session, and `TIZDrive`'s Z-move check believes the PFS is engaged and
+stalls ~10 s per Z move. The patch rewrites the adapter's `IsEnabled`
+read to derive from the live PFS `Status` instead of the cache, which
+fixes all three at once.
+
+**Where it lives.** The patch script and the byte-level details are kept
+outside the repo, in the DLL backup folder, next to the stock DLL
+backups and `CHECKSUMS-original.txt`:
+
+```
+C:\Users\lh21x018\dll-backups\20260821-162134\patch_pfs_readfix.py
+```
+
+Do not copy the offsets into the repo: they are derived from the closed
+adapter, so keep them in that external script only.
+
+**Apply / check / revert** (run elevated; the DLL is under
+`Program Files`):
+
+```
+python patch_pfs_readfix.py --show      # reports ORIGINAL / PATCHED / UNKNOWN
+python patch_pfs_readfix.py --apply      # backs up, patches, verifies
+python patch_pfs_readfix.py --restore    # revert to the stock adapter
+```
+
+It refuses to patch unless it recognises the stock adapter (prologue +
+`Status` entry checks) and writes a timestamped `.bak` beside the DLL.
+
+**Dependency.** faro's fast-Z path (`_set_event_z` disengage/re-engage)
+and the truthful software PFS read depend on this patch. Without it faro
+still runs, but every Z-carrying event stalls ~10 s and the PFS is not
+re-engaged from software at teardown (both surfaced as warnings). PR #18
+documents the exact degraded behaviour.
+
+**When it needs redoing.** Any MM update replaces
+`mmgr_dal_NikonTI.dll`, so re-run `--show` after updating and `--apply`
+if it reports ORIGINAL. The offsets are specific to the `api75` build
+dated 2026-03-22 (SHA256 `6479C7F5...`); a different adapter build needs
+the offsets re-verified first (the script's `--show` / verify step
+refuses a mismatch rather than patching blind).
+
+**Reported upstream.** mmCoreAndDevices #982 (filed 2026-08-26): PFS
+enabled-read stale + enable/disable write-latch on the NikonTI adapter.
+https://github.com/micro-manager/mmCoreAndDevices/issues/982
+If a future nightly fixes the enabled read at the source, this patch
+becomes unnecessary: retest with `--show` plus a plain enable/disable
+toggle before dropping it.
+
+---
+
+## 7. Other Pertzlab Nikon scopes likely hit the same bug (unverified)
+
+The stuck-`Busy()` / stale-PFS problems are Nikon-adapter bugs, not
+Moench-specific. Our fixes (`MoenchCMMCorePlus`) and the readfix patch
+run only on Moench: `Jungfrau` and `Niesen` build a plain
+`CMMCorePlus`, and the patch is a machine-local DLL edit, so neither is
+affected by our work. But both are Nikon scopes that probably suffer the
+same underlying issues with no fix applied.
+
+- **Jungfrau: same Ti1 `NikonTI` family, uses PFS (`USE_ONLY_PFS = True`,
+  config `TiFluoroJungfrau_w_TTL_NIDAQ.cfg`).** Almost certainly pays the
+  same ~5 s stuck-`Busy` per move, ~10 s-per-Z stall, and unreliable
+  software PFS read that Moench did. Best candidate to receive the same
+  treatment: share the core (a `JungfrauCMMCorePlus` mirroring
+  `MoenchCMMCorePlus`, or lift the position-confirm to a shared base) and
+  apply the readfix. Caveat: Jungfrau is MM `api74`, a different adapter
+  build, so re-verify the patch offsets against *its*
+  `mmgr_dal_NikonTI.dll` first (the script fails safe on a mismatch).
+
+- **Niesen: Nikon Ti2 (`NikonTi2` adapter, config
+  `Ti2CicercoConfig_w_DMD_w_TTL.cfg`).** Different adapter with different
+  internals, so the readfix does not transfer, and Ti2 PFS uses the
+  separate FocusMaintenance mechanism. It hits the Ti2 flavour of these
+  bugs instead (see mmCoreAndDevices #42, #45, #568, #826). The
+  position-confirm idea would still help but needs a separate port; the
+  PFS handling would need rethinking for Ti2.
+
+**Unverified.** This is inferred from the config filenames and the
+`USE_ONLY_PFS` flags, not observed on either scope's hardware. Cheap
+check per scope: time a stage move plus `waitForSystem`, and toggle PFS
+enable/disable twice, and see whether the Moench symptoms appear before
+committing to a port.
