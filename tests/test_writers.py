@@ -5,7 +5,7 @@ focus on schema invariants that downstream analysis scripts depend on:
 
 * TiffWriter: filename convention (``<folder>/<fname>.tiff``), lazy
   folder creation, round-trip of written bytes.
-* OmeZarrWriter single-position: ome-writers stream path, label-group
+* OmeZarrWriter single-position: direct store path, ``(t, c, y, x)``, label-group
   creation, stim-channel routing.
 * OmeZarrWriter multi-position: direct store path, ``(t, p, c, y, x)``
   axis layout, multiscales metadata.
@@ -133,7 +133,7 @@ def _write_full_run(writer, *, n_pos: int, n_t: int = N_T) -> None:
 
 
 class TestOmeZarrWriterSinglePosition:
-    """Single-FOV uses the ome-writers stream path."""
+    """Single-FOV uses the direct-zarr path: ``(t, c, y, x)`` at root ``0``."""
 
     @pytest.fixture
     def zarr_path(self, tmp_dir):
@@ -415,6 +415,51 @@ class TestOmeZarrWriterPlate:
 # ===========================================================================
 # OmeZarrWriter: label pre-sizing, dynamic extension, crash recovery
 # ===========================================================================
+
+
+class TestOmeZarrContinuePastDeclared:
+    """A run continued past ``n_timepoints`` lands in the store, and growing
+    the axis is one metadata write per batch, not one per frame.
+
+    Covers both layouts: single position ``(t, c, y, x)`` and multi-position
+    ``(t, p, c, y, x)``. The single-position case used to be an ome-writers
+    stream that could not grow at all (bounded) or grew one timepoint per
+    frame (unbounded), rewriting ``0/zarr.json`` on every write.
+    """
+
+    @pytest.mark.parametrize("n_pos", [1, 2])
+    def test_continue_grows_once_and_keeps_frames(self, tmp_dir, n_pos):
+        writer = OmeZarrWriter(tmp_dir, store_stim_images=False, n_timepoints=N_T)
+        writer.init_stream(
+            position_names=[f"Pos{i}" for i in range(n_pos)],
+            channel_names=IMG_CHANNELS,
+            image_height=IMG_H,
+            image_width=IMG_W,
+            n_timepoints=N_T,
+            n_stim_channels=0,
+        )
+        for t in range(N_T):
+            for p in range(n_pos):
+                writer.write(_raw(t, p), _meta(t, p), "raw")
+
+        # A second phase is appended: the Controller pre-sizes once ...
+        writer.set_n_timepoints(2 * N_T)
+        array_meta = Path(tmp_dir) / ZARR_DIRNAME / "0" / "zarr.json"
+        snapshot = array_meta.read_bytes()
+        # ... and the frames of that phase must not touch the metadata again.
+        for t in range(N_T, 2 * N_T):
+            for p in range(n_pos):
+                writer.write(_raw(t, p), _meta(t, p), "raw")
+        assert array_meta.read_bytes() == snapshot, "zarr.json rewritten per frame"
+        writer.close()
+
+        store = str(Path(tmp_dir) / ZARR_DIRNAME)
+        raw = zarr.open_group(store, mode="r")["0"]
+        assert raw.shape[0] == 2 * N_T
+        reader = OmeZarrRawReader(store)
+        for p in range(n_pos):
+            last = reader.read(2 * N_T - 1, p)
+            np.testing.assert_array_equal(last, _raw(2 * N_T - 1, p))
 
 
 class TestOmeZarrLabelPresizeAndRepair:

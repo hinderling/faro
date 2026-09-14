@@ -985,6 +985,7 @@ class Controller:
             offset_events,
             key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)),
         )
+        self._grow_writer_timeline(offset_events)
 
         handle = RunHandle(
             n_events_total=len(offset_events),
@@ -1133,6 +1134,7 @@ class Controller:
 
         events = list(events)
         offset_events = self._offset_events(events)
+        self._grow_writer_timeline(offset_events)
         # Add events + sentinel; bump counter so the stream keeps going. Lock
         # because the event stream reads _pending_sentinels from the MDA
         # thread while extend_experiment runs from the caller's thread.
@@ -1246,6 +1248,18 @@ class Controller:
     # ------------------------------------------------------------------
     # Internal helpers for continuation
     # ------------------------------------------------------------------
+
+    def _grow_writer_timeline(self, offset_events) -> None:
+        """Pre-size the writer's time axis for appended events.
+
+        One resize up front instead of one per frame past the first run's
+        declared length (see ``OmeZarrWriter.set_n_timepoints``). Writers
+        without that method, and empty batches, are ignored.
+        """
+        grow = getattr(getattr(self, "_writer", None), "set_n_timepoints", None)
+        if grow is None or not offset_events:
+            return
+        grow(max(e.index.get("t", 0) for e in offset_events) + 1)
 
     def _offset_events(self, events):
         """Offset event timesteps and metadata for continuation."""

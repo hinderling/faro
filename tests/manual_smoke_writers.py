@@ -4,7 +4,7 @@ Runs the writers against synthetic numpy frames — no Micro-Manager, no
 microscope, no Controller. Exercises all three storage layouts:
 
   * multi-position direct  (OmeZarrWriter, n_pos > 1)
-  * single-position stream (OmeZarrWriter, n_pos == 1, via ome-writers)
+  * single-position store (OmeZarrWriter, n_pos == 1, direct zarr path)
   * plate layout           (OmeZarrWriterPlate)
 
 For each scenario: init_stream -> write raw + stim + label frames ->

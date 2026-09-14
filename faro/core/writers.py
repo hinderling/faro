@@ -282,16 +282,21 @@ class OmeZarrRawReader:
 class OmeZarrWriter:
     """Streams acquisition data into a single OME-Zarr v0.5 store.
 
-    Uses one ``ome-writers`` stream with a position dimension so that all
-    positions live inside a single bf2raw zarr container.
+    The raw array is built directly with zarr-python (see
+    :meth:`_init_stream_direct`): ``(t, c, y, x)`` for a single position,
+    ``(t, p, c, y, x)`` for several, always at the root ``"0"`` array. The
+    time axis is pre-sized to ``n_timepoints``, grown once per appended batch
+    by :meth:`set_n_timepoints`, and trimmed to the written length on
+    :meth:`close`, so a run can be continued or extended without rewriting
+    the array metadata on every frame.
 
     Positions are configured automatically by the Controller from the
     event list (via :meth:`init_stream`), or can be set manually.
 
     Routing:
-    - ``"raw"`` — appended to the primary OME-Zarr image stream.
-    - ``"stim"`` — appended as an additional channel in the raw stream.
-      Zeros are written for non-stim timepoints.
+    - ``"raw"`` — written into the primary OME-Zarr image array.
+    - ``"stim"`` — written as additional channel(s) of the raw array.
+      Non-stim timepoints keep the zero fill value.
     - ``"ref"`` — TIFF fallback (different channel count).
     - Everything else — stored as NGFF label groups under each position's
       image group, created lazily on first write.
@@ -335,7 +340,10 @@ class OmeZarrWriter:
                 stim readout images are stored as additional channel(s) in the
                 raw zarr array (zeros for non-stim timepoints).  If False
                 (default), stim readouts fall back to TIFF.
-            n_timepoints: Expected number of timepoints. None = unbounded.
+            n_timepoints: Expected number of timepoints; pre-sizes the raw
+                and label arrays. Continued or extended runs grow it via
+                :meth:`set_n_timepoints`; :meth:`close` trims to the written
+                length.
             label_dtype: Dtype for label arrays.
             raw_chunk_t: Temporal chunk size for raw data.
             raw_shard_t: Temporal shard size for raw data (None = same as chunk).
@@ -356,7 +364,7 @@ class OmeZarrWriter:
         self._overwrite = overwrite
 
         # Set by init_stream() — derived from events + microscope
-        self._stream = None  # ome-writers stream (single-position)
+        self._stream = None  # ome-writers stream (OmeZarrWriterPlate only)
         self._raw_array = None  # direct zarr array (multi-position)
         self._image_height: int = 0
         self._image_width: int = 0
@@ -417,7 +425,7 @@ class OmeZarrWriter:
         n_timepoints: int | None = None,
         n_stim_channels: int = 0,
     ) -> None:
-        """Create the ome-writers stream.
+        """Create the OME-Zarr store.
 
         Called by :class:`Controller` during :meth:`run_experiment` with
         values derived from the event list and microscope hardware.
@@ -447,79 +455,19 @@ class OmeZarrWriter:
         for i in range(self._n_stim_channels):
             all_channel_names.append(f"stim_{i}")
         total_channels = len(all_channel_names)
-        n_pos = len(position_names)
 
-        if n_pos > 1:
-            # --- Multi-position: build zarr store directly ---
-            # ome-writers/yaozarrs can't handle custom axis types between
-            # time and space (axis order bug). Build the store ourselves
-            # so we get a single 5D array (t, p, c, y, x) with full control.
-            self._init_stream_direct(
-                position_names,
-                all_channel_names,
-                total_channels,
-            )
-        else:
-            # --- Single position: use ome-writers ---
-            self._init_stream_ome_writers(all_channel_names, total_channels)
-
-    def _init_stream_ome_writers(
-        self,
-        all_channel_names: list[str],
-        total_channels: int,
-    ) -> None:
-        """Single-position stream via ome-writers."""
-        from ome_writers import AcquisitionSettings, Dimension, create_stream
-
-        dimensions = []
-
-        # Time (unbounded OK — it's the first dimension)
-        t_kwargs: dict = dict(
-            name="t",
-            count=self._n_timepoints,
-            chunk_size=self._raw_chunk_t,
-            type="time",
+        # Build the store directly with zarr-python for any number of
+        # positions. The single-position case used to go through an
+        # ome-writers stream, but that stream cannot be continued: a bounded
+        # time axis refuses appends past the declared count, and an unbounded
+        # one (ome-writers <= 0.3.2) grows by exactly one timepoint per frame,
+        # rewriting the array's zarr.json on every write. The direct path
+        # pre-sizes, grows once per batch, and trims on close.
+        self._init_stream_direct(
+            position_names,
+            all_channel_names,
+            total_channels,
         )
-        if self._raw_shard_t is not None and self._raw_shard_t != self._raw_chunk_t:
-            t_kwargs["shard_size_chunks"] = self._raw_shard_t // self._raw_chunk_t
-        dimensions.append(Dimension(**t_kwargs))
-
-        if total_channels > 1:
-            dimensions.append(
-                Dimension(
-                    name="c",
-                    count=total_channels,
-                    chunk_size=1,  # one chunk per channel
-                    shard_size_chunks=total_channels,  # all channels in one shard
-                    type="channel",
-                    coords=all_channel_names,
-                )
-            )
-
-        dimensions.append(
-            Dimension(
-                name="y",
-                count=self._image_height,
-                chunk_size=self._image_height,
-                type="space",
-            )
-        )
-        dimensions.append(
-            Dimension(
-                name="x",
-                count=self._image_width,
-                chunk_size=self._image_width,
-                type="space",
-            )
-        )
-
-        settings = AcquisitionSettings(
-            root_path=self._zarr_path,
-            dimensions=dimensions,
-            dtype=self._dtype,
-            overwrite=self._overwrite,
-        )
-        self._stream = create_stream(settings)
 
     def _init_stream_direct(
         self,
@@ -527,10 +475,13 @@ class OmeZarrWriter:
         all_channel_names: list[str],
         total_channels: int,
     ) -> None:
-        """Multi-position stream built directly with zarr-python.
+        """Build the raw array directly with zarr-python.
 
-        Bypasses yaozarrs' axis order validator which incorrectly rejects
-        custom types between time and space.
+        Used for every position count. With one position the leading axes
+        are ``(t,)``; with several they are ``(t, p)``. Bypasses ome-writers /
+        yaozarrs, whose axis order validator rejects a custom position axis
+        between time and space, and whose stream cannot be pre-sized and
+        grown in one step (see :meth:`set_n_timepoints`).
         """
         import shutil
         import zarr
@@ -624,6 +575,7 @@ class OmeZarrWriter:
             dtype=self._dtype,
             fill_value=0,
             overwrite=True,
+            dimension_names=[str(a["name"]) for a in axes],
             chunk_key_encoding={"name": "v2", "separator": "."},
         )
 
@@ -784,30 +736,34 @@ class OmeZarrWriter:
         a time (which rewrites each array's ``zarr.json`` on every frame — a
         replace-over-existing that is slow and crash-fragile on SMB shares).
 
-        No-op when ``n`` does not exceed the current declared length. Only the
-        direct (multi-position) path pre-sizes; the single-position ome-writers
-        stream grows on append and is unaffected.
+        No-op when ``n`` does not exceed the current declared length. The
+        Controller calls this from ``continue_experiment`` and
+        ``extend_experiment``. :class:`OmeZarrWriterPlate` still streams raw
+        frames through a bounded ome-writers stream, so for it this only grows
+        the label arrays and plate runs cannot be continued yet.
         """
         if n <= (self._n_timepoints or 0):
             return
         self._n_timepoints = n
-        if self._raw_array is not None and self._raw_array.shape[0] < n:
-            self._raw_array.resize((n,) + tuple(self._raw_array.shape[1:]))
-        for arr in self._label_arrays.values():
-            if arr.shape[0] < n:
-                arr.resize((n,) + tuple(arr.shape[1:]))
+        # Same lock as _maybe_resize_leading: this runs on the caller's thread
+        # while the writer thread may be growing the same arrays.
+        with self._label_lock:
+            if self._raw_array is not None and self._raw_array.shape[0] < n:
+                self._raw_array.resize((n,) + tuple(self._raw_array.shape[1:]))
+            for arr in self._label_arrays.values():
+                if arr.shape[0] < n:
+                    arr.resize((n,) + tuple(arr.shape[1:]))
 
     # ------------------------------------------------------------------
-    # Raw frames → ome-writers stream
+    # Raw frames → zarr array (direct) or ome-writers stream (plate subclass)
     # ------------------------------------------------------------------
 
     def _write_raw(self, img: np.ndarray, metadata: dict) -> None:
-        """Append imaging frame(s) to the OME-Zarr store."""
+        """Write imaging frame(s) into the OME-Zarr store."""
         if self._stream is not None:
-            # Single-position: use ome-writers stream
+            # ome-writers stream (only OmeZarrWriterPlate sets one up)
             self._write_raw_stream(img, metadata)
         else:
-            # Multi-position: direct zarr write
             self._write_raw_direct(img, metadata)
 
     def _write_raw_stream(self, img: np.ndarray, metadata: dict) -> None:
