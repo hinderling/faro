@@ -673,6 +673,7 @@ class Moench(PyMMCoreMicroscope):
     #
     # Derived from TiMoench.cfg: each preset sets NIDAQDO-Dev1/port0 State, and
     # the port's state labels give the color -> Spectra <Color>_Level:
+    #   State  1 Violet      -> Violet_Level
     #   State  2 Blue        -> Blue_Level
     #   State  4 Cyan        -> Cyan_Level
     #   State  8 Teal        -> Teal_Level
@@ -680,6 +681,7 @@ class Moench(PyMMCoreMicroscope):
     #   State 32 Red         -> Red_Level
     POWER_PROPERTIES = {
         "CyanStim": ("LED", "Cyan_Level"),    # state 4
+        "VioletStim": ("LED", "Violet_Level"),  # state 1, UV damage stim
         "mScarlet3": ("LED", "Green_Level"),  # state 16
         "miRFP": ("LED", "Red_Level"),        # state 32
         "mCitrine": ("LED", "Teal_Level"),    # state 8
