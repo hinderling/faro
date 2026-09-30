@@ -25,7 +25,7 @@ STIM = {"config": "CyanStim", "exposure": 50}
 def _scope(slm_affine=None):
     from vmteach import load_microscope
 
-    core, sim = load_microscope("optogenetic", seed=0)  # stepped: deterministic
+    core, sim = load_microscope("optogenetic", seed=0, mode="stepped")  # deterministic
     sim.slm_affine = slm_affine
     mic = UniMMCoreSimulation(mmc=core)
     mic.init_scope()
@@ -72,7 +72,7 @@ def test_validate_events_warns_until_calibrated():
         RTMSequence(
             time_plan={"interval": 1.0, "loops": 2},
             stage_positions=[{"x": 0.0, "y": 0.0, "z": 0.0}],
-            channels=[{"config": "DAPI", "exposure": 50}],
+            channels=[{"config": "miRFP", "exposure": 50}],
             stim_channels=[STIM],
             stim_frames=range(2),
         )
